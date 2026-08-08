@@ -150,7 +150,7 @@ jobs:
           port="${{ vars.APP_PORT || secrets.APP_PORT }}"
           echo "port=$port" >> "$GITHUB_ENV"
           docker run -d --name smoke-test --env-file .env.runtime -p "$port:$port" \
-            ${{ secrets.DOCKER_USER }}/python-app:${{ needs.build-and-push.outputs.app_env }}
+            ${{ secrets.DOCKER_USER }}/python-app-seminario:${{ needs.build-and-push.outputs.app_env }}
 
       - name: Wait for container to be ready
         run: |
