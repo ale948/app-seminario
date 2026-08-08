@@ -3,8 +3,7 @@ name: CI/CD Pipeline Seminario
 on:
   push:
     branches:
-      - main
-      - develop
+      - "**"
 
   pull_request:
     branches:
@@ -21,6 +20,8 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -36,17 +37,29 @@ jobs:
         run: |
           pip install -r requirements.txt
 
+      - name: Run Snyk to check for vulnerable dependencies
+        uses: snyk/actions/python@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --file=requirements.txt --severity-threshold=high
+
       - name: Run linter
         run: |
           python -m flake8 app.py tests/ --max-line-length=88
 
       - name: Run tests
         run: |
-          python -m pytest tests/ -v --tb=short
+          python -m pytest tests/ -v --tb=short --cov=. --cov-report=xml
 
       - name: Check Flask application
         run: |
           python -c "from app import app; print('Flask application loaded successfully')"
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
 
   build-and-push:
@@ -55,7 +68,7 @@ jobs:
     needs:
       - test
 
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push'
 
     runs-on: ubuntu-latest
 
@@ -64,17 +77,104 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set environment from branch
+        id: vars
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "app_env=prod" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.ref }}" = "refs/heads/develop" ]; then
+            echo "app_env=test" >> "$GITHUB_OUTPUT"
+          else
+            echo "app_env=dev" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USER }}
           password: ${{ secrets.DOCKER_TOKEN }}
 
-      - name: Build and Push Docker Image
+      - name: Build Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: |
+            ${{ secrets.DOCKER_USER }}/python-app-seminario:${{ steps.vars.outputs.app_env }}
+            ${{ secrets.DOCKER_USER }}/python-app-seminario:${{ steps.vars.outputs.app_env }}-${{ github.sha }}
+
+      - name: Run Snyk to check Docker image for vulnerabilities
+        uses: snyk/actions/docker@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          image: ${{ secrets.DOCKER_USER }}/python-app-seminario:${{ steps.vars.outputs.app_env }}
+          args: --severity-threshold=high --file=Dockerfile
+
+      - name: Push Docker Image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
-            ${{ secrets.DOCKER_USER }}/python-app:latest
-            ${{ secrets.DOCKER_USER }}/python-app:${{ github.sha }}
+            ${{ secrets.DOCKER_USER }}/python-app-seminario:${{ steps.vars.outputs.app_env }}
+            ${{ secrets.DOCKER_USER }}/python-app-seminario:${{ steps.vars.outputs.app_env }}-${{ github.sha }}
+
+    outputs:
+      app_env: ${{ steps.vars.outputs.app_env }}
+
+  smoke-test:
+    name: Smoke Test Environment Variables
+
+    needs:
+      - build-and-push
+
+    environment: ${{ needs.build-and-push.outputs.app_env }}
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Write .env from environment secrets
+        run: |
+          cat <<EOF > .env.runtime
+          APP_ENV=${{ vars.APP_ENV || secrets.APP_ENV }}
+          APP_HOST=${{ vars.APP_HOST || secrets.APP_HOST }}
+          APP_PORT=${{ vars.APP_PORT || secrets.APP_PORT }}
+          APP_DEBUG=${{ vars.APP_DEBUG || secrets.APP_DEBUG }}
+          EOF
+
+      - name: Run container with environment file
+        run: |
+          port="${{ vars.APP_PORT || secrets.APP_PORT }}"
+          echo "port=$port" >> "$GITHUB_ENV"
+          docker run -d --name smoke-test --env-file .env.runtime -p "$port:$port" \
+            ${{ secrets.DOCKER_USER }}/python-app:${{ needs.build-and-push.outputs.app_env }}
+
+      - name: Wait for container to be ready
+        run: |
+          for i in $(seq 1 10); do
+            if curl -sf http://localhost:$port/health; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Container did not become ready"
+          docker logs smoke-test
+          exit 1
+
+      - name: Verify environment matches expected branch environment
+        run: |
+          actual=$(curl -sf http://localhost:$port/health | python3 -c "import sys, json; print(json.load(sys.stdin)['environment'])")
+          expected="${{ needs.build-and-push.outputs.app_env }}"
+          echo "Expected environment: $expected, Actual environment: $actual"
+          if [ "$actual" != "$expected" ]; then
+            echo "Environment mismatch!"
+            exit 1
+          fi
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f smoke-test || true
